@@ -1,566 +1,657 @@
-;*************
-;*     Configuración inicial       *
-;*************
-.include "m328pdef.inc"
+.include "M328PDEF.inc"
+.equ VALOR_T1 = 0xBDC
 
-;*************
-;*     Registros y Variables       *
-;*************
-.def temp = r16
-.def temp2 = r9
-.def sreg_temp = r17
-.def display_actual = r18
-.def digit_sel = r19
-.def modo = r20
-.def debounce_counter = r21
-.def estado = r22
-.def hora_h = r23
-.def hora_l = r24
-.def min_h = r25   
-.def min_l = r12   
-.def dia_d = r13   
-.def dia_u = r14  
-.def mes_d = r15 
-.def mes_u = r10   
-.def alarma_h = r11
-.def alarma_m = r8 
+.CSEG
+.ORG 0x00
+	JMP MAIN
+.ORG 0x0006
+	JMP ISR_PCINT0
+.ORG 0x001A
+	JMP ISR_TIMER1_OVF
+.ORG 0x0020
+	JMP ISR_TIMER0_OVF
+
+MAIN:
+/********* CONFIGURACIÃ“N DEL STACK *************/
+	LDI R16, LOW(RAMEND)
+	OUT SPL, R16
+	LDI R17, HIGH(RAMEND)
+	OUT SPH, R17
+
+SETUP:
+/********* CONFIGURACIÃ“N DE PUERTOS *************/
+	LDI R16, 0xFF
+	OUT DDRD, R16  ; PD0-PD6 como salida (segmentos de displays)
+
+	LDI R16, 0b00000111
+	OUT DDRB, R16  ; PB0-PB2 como salida (transistores de displays)
+	SBI DDRB, PB5  ; PB5 como salida (buzzer)
+
+	SBI DDRD, PD7  ; PD7 como salida (transistor de displays)
+
+	LDI R16, 0b00011111
+	OUT PORTC, R16 ; PC0-PC4 como entrada con pull-up (botones)
+
+	CBI DDRB, PB4  ; PB4 como salida (LED 1)
+	CBI DDRB, PB3  ; PB3 como salida (LED 2)
+
+/********* CONFIGURACIÃ“N DEL RELOJ *************/
+	LDI R16, (1 << CLKPCE)
+	STS CLKPR, R16
+	LDI R16, 0b0000_0000
+	STS CLKPR, R16  ; 16MHz sin prescaler
+
+/********* CONFIGURACIÃ“N DE INTERRUPCIONES *************/
+	LDI R16, (1 << PCIE1)
+	STS PCICR, R16
+	LDI R16, 0b00011111  ; Habilitar interrupciones en PC0-PC4 (botones)
+	STS PCMSK1, R16
+
+	SEI ; Habilitar interrupciones globales
+
+/********* TABLA PARA DISPLAYS *************/
+TABLA: .DB 0x3F, 0x06, 0x5B, 0x4F, 0X66, 0X6D, 0X7D, 0X07, 0X7F, 0X6F
+
+/********* VARIABLES DE TIEMPO *************/
+LDI R19, 0  ; Horas decenas
+LDI R20, 0  ; Horas unidades
+LDI R21, 0  ; Minutos decenas
+LDI R22, 0  ; Minutos unidades
+
+/********* INICIALIZAR TIMERS *************/
+CALL INIC_TIMER_0
+CALL INIC_TIMER_1
+
+JMP LOOP
+
+/*************************************/
+/********* CONFIGURACIÃ“N DE TIMERS ***********/
+/*************************************/
+
+INIC_TIMER_0:  ; Timer 0 para retardos cortos (parpadeo, multiplexaciÃ³n)
+	LDI R17, 0
+	OUT TCCR0A, R17  ; Modo normal
+
+	LDI R17, (1 << CS02) | (1 << CS00)  ; Prescaler 1024
+	OUT TCCR0B, R17
+
+	LDI R17, 194  ; Carga inicial (ajustar segÃºn retardo)
+	OUT TCNT0, R17
+
+	LDI R17, (1 << TOIE0)  ; Habilitar interrupciÃ³n por overflow
+	STS TIMSK0, R17
+
+	RET
+
+INIC_TIMER_1:  ; Timer 1 para conteo del tiempo (segundos, minutos, etc.)
+	LDI R17, HIGH(VALOR_T1)
+	STS TCNT1H, R17
+	LDI R17, LOW(VALOR_T1)
+	STS TCNT1L, R17
+
+	CLR R17
+	STS TCCR1A, R17  ; Modo normal
+
+	LDI R17, (1 << CS12) | (1 << CS10)  ; Prescaler 1024
+	STS TCCR1B, R17
+
+	LDI R17, (1 << TOIE1)  ; Habilitar interrupciÃ³n por overflow
+	STS TIMSK1, R17
+
+	RET
+
+/*************************************/
+/********* MANEJO DE INTERRUPCIONES ***********/
+/*************************************/
+
+ISR_TIMER0_OVF:  ; InterrupciÃ³n de Timer0 (multiplexaciÃ³n/parpadeo)
+	PUSH R17
+	IN R17, SREG
+	PUSH R17
+
+	LDI R17, 194
+	OUT TCNT0, R17
+	SBI TIFR0, TOV0  ; Limpiar flag de overflow
+
+	INC R23  ; Contador para multiplexaciÃ³n de displays
+	INC R18  ; Contador de parpadeo
+
+	POP R17
+	OUT SREG, R17
+	POP R17
+
+	RETI
+
+ISR_TIMER1_OVF:  ; InterrupciÃ³n de Timer1 (actualizaciÃ³n de tiempo)
+	PUSH R16
+	IN R16, SREG
+	PUSH R16
+
+	LDI R16, HIGH(VALOR_T1)
+	STS TCNT1H, R16
+	LDI R16, LOW(VALOR_T1)
+	STS TCNT1L, R16
+	SBI TIFR1, TOV1  ; Limpiar flag de overflow
+
+	INC R22  ; Incrementar segundos unidades
+	CPI R22, 10
+	BREQ MINUTO_COMPLETO
+	JMP FIN_ISR_T1
+
+MINUTO_COMPLETO:
+	CLR R22
+	INC R21  ; Incrementar minutos decenas
+	CPI R21, 6
+	BREQ HORA_COMPLETA
+	JMP FIN_ISR_T1
+
+HORA_COMPLETA:
+	CLR R21
+	INC R20  ; Incrementar horas unidades
+	CPI R20, 10
+	BREQ DECENA_HORA
+	JMP FIN_ISR_T1
+
+DECENA_HORA:
+	CLR R20
+	INC R19  ; Incrementar horas decenas
+	CPI R19, 2
+	BREQ LIMITE_24H
+	JMP FIN_ISR_T1
+
+LIMITE_24H:
+	CPI R20, 4
+	BREQ RESETEAR_HORA
+	JMP FIN_ISR_T1
+
+RESETEAR_HORA:
+	CLR R19
+	CLR R20
+
+FIN_ISR_T1:
+	POP R16
+	OUT SREG, R16
+	POP R16
+	RETI
+
+ISR_PCINT0:  ; InterrupciÃ³n por cambio en botones (PC0-PC4)
+	PUSH R17
+	IN R17, SREG
+	PUSH R17
+
+	IN R0, PINC
+	SBRS R0, PC0
+	INC R20  ; Incrementar hora unidades
+	SBRS R0, PC1
+	DEC R20  ; Decrementar hora unidades
+	SBRS R0, PC2
+	INC R22  ; Incrementar minutos unidades
+	SBRS R0, PC3
+	DEC R22  ; Decrementar minutos unidades
+	SBRS R0, PC4
+	INC R17  ; Cambiar modo
+
+	SBI PCIFR, PCIF0  ; Limpiar flag de interrupciÃ³n
+
+	POP R17
+	OUT SREG, R17
+	POP R17
+	RETI
 
 
+	/*************************************/
+/********* MULTIPLEXACIÃ“N DE DISPLAYS ***********/
+/*************************************/
+MOSTRAR_HORA:
+	; Apagar todos los transistores antes de actualizar
+	LDI R16, 0b00000111
+	OUT PORTB, R16
+	SBI PORTD, PD7
 
-; Variables en SRAM
-.dseg
-.org 0x100
-ticks_250ms: .byte 1
-segundos: .byte 1
+	; Cargar direcciÃ³n de la tabla de segmentos
+	LDI ZH, HIGH(TABLA << 1)
+	LDI ZL, LOW(TABLA << 1)
 
-;*************
-;*     Definición de pines          *
-;*************
-.equ BUTTON_MODE = PINC0  
-.equ BUTTON_SEL = PINC1   
-.equ BUTTON_INC = PINC2   
-.equ BUTTON_DEC = PINC3   
-.equ LED1 = PB3          
-.equ LED2 = PB4          
+	; **DÃ­gito 1: Horas Decenas**
+	ADD ZL, R19
+	LPM R25, Z  ; Cargar patrÃ³n de segmentos
+	OUT PORTD, R25
+	CBI PORTB, PB2  ; Activar transistor de display 1
+	CALL ESPERA
 
-; Tabla de segmentos (cátodo común)
-tabla_7seg:
-    .db 0b00111111, 0b00000110  ; 0, 1
-    .db 0b01011011, 0b01001111  ; 2, 3
-    .db 0b01100110, 0b01101101  ; 4, 5
-    .db 0b01111101, 0b00000111  ; 6, 7
-    .db 0b01111111, 0b01101111  ; 8, 9
+	; **DÃ­gito 2: Horas Unidades**
+	ADD ZL, R20
+	LPM R25, Z
+	OUT PORTD, R25
+	SBI PORTB, PB2  ; Apagar display anterior
+	CBI PORTB, PB1  ; Activar transistor de display 2
+	CALL ESPERA
 
+	; **DÃ­gito 3: Minutos Decenas**
+	ADD ZL, R21
+	LPM R25, Z
+	OUT PORTD, R25
+	SBI PORTB, PB1
+	CBI PORTB, PB0  ; Activar transistor de display 3
+	CALL ESPERA
 
+	; **DÃ­gito 4: Minutos Unidades**
+	ADD ZL, R22
+	LPM R25, Z
+	OUT PORTD, R25
+	SBI PORTB, PB0
+	CBI PORTD, PD7  ; Activar transistor de display 4
+	CALL ESPERA
+	SBI PORTD, PD7  ; Apagar transistor de display 4
 
-;*************
-;*     Constantes                  *
-;*************
-.cseg
-.org 0x0000
-    rjmp RESET
-.org 0x0020
-    rjmp TIMER0_OVF    
+	RET
 
-;*************
-;*     Programa principal          *
-;*************
-RESET:
-    ; Configuración del stack pointer
-    ldi temp, high(RAMEND)
-    out SPH, temp
-    ldi temp, low(RAMEND)
-    out SPL, temp
+/*************************************/
+/********* ESPERA PARA MULTIPLEXACIÃ“N ***********/
+/*************************************/
+ESPERA:
+	LDI R23, 50  ; Ajusta este valor para optimizar la velocidad de refresco
+DELAY:
+	DEC R23
+	BRNE DELAY
+	RET
 
-    ; Configuración de puertos
-    ldi temp, 0xFF
-    out DDRD, temp      ; PORTD como salida (para los segmentos)
-    ldi temp, (1<<PB0)|(1<<PB1)|(1<<PB2)|(1<<LED1)|(1<<LED2)
-    out DDRB, temp     
+/*************************************/
+/********* MANEJO DE BOTONES *********/
+/*************************************/
 
+ISR_PCINT0:  ; InterrupciÃ³n por cambio en botones (PC0-PC4)
+	PUSH R17
+	IN R17, SREG
+	PUSH R17
 
-	
+	IN R0, PINC
+	SBRS R0, PC0
+	INC R20  ; Incrementar hora unidades
+	SBRS R0, PC1
+	DEC R20  ; Decrementar hora unidades
+	SBRS R0, PC2
+	INC R22  ; Incrementar minutos unidades
+	SBRS R0, PC3
+	DEC R22  ; Decrementar minutos unidades
+	SBRS R0, PC4
+	INC R17  ; Cambiar modo
 
-    ; Configuración de entradas
-    ldi temp, 0x00
-    out DDRC, temp      
-    ldi temp, (1<<BUTTON_MODE)|(1<<BUTTON_SEL)|(1<<BUTTON_INC)|(1<<BUTTON_DEC)
-    out PORTC, temp     
+	; Limpiar flag de interrupciÃ³n
+	SBI PCIFR, PCIF0  
 
-    ; Inicialización de variables
-    clr temp
-    mov estado, temp
-    mov hora_h, temp
-    mov hora_l, temp
-    mov min_h, temp
-    mov min_l, temp
-    mov dia_d, temp
-    mov dia_u, temp
-    mov mes_d, temp
-    mov mes_u, temp
-    mov alarma_h, temp
-    mov alarma_m, temp
-    sts ticks_250ms, temp
-    clr display_actual
-    clr digit_sel
+	POP R17
+	OUT SREG, R17
+	POP R17
+	RETI
 
-    ; Configuración Timer0
-    ldi temp, (1<<CS01)    
-    out TCCR0B, temp
-    ldi temp, (1<<TOIE0)   
-    sts TIMSK0, temp
-
-    sei  
-
-MAIN_LOOP:
-    rcall CHECK_BUTTONS
-    rjmp MAIN_LOOP
-
-;*************
-;*     Rutina de Timer            *
-;*************
-TIMER0_OVF:
-    push temp
-    in temp, SREG
-    push temp
-    push sreg_temp
-
-    ; Moverse al siguiente display
-    inc display_actual
-    cpi display_actual, 4  ; Hay 4 displays (0,1,2,3)
-    brne CONTINUE_TIMER
-    clr display_actual  ; Si llega a 4, reiniciar a 0
-
-
-
-
-CONTINUE_TIMER:
-    lds temp, ticks_250ms
-    inc temp
-    cpi temp, 240
-    brne UPDATE_DISPLAYS
-
-    clr temp
-    sts ticks_250ms, temp
-
-UPDATE_DISPLAYS:
-    ; Apagar todos los displays primero
-    ldi temp, 0x00
-    out PORTB, temp  
-
-    ; Mostrar el dígito correspondiente
-    mov temp, display_actual
-    cpi temp, 0
-    breq SHOW_H10
-    cpi temp, 1
-    breq SHOW_H1
-    cpi temp, 2
-    breq SHOW_M10
-    cpi temp, 3
-    breq SHOW_M1
-    rjmp END_TIMER
-
-SHOW_H10:        
-    mov temp, hora_h
-    rcall OBTENER_PATRON
-    out PORTD, temp  
-    ldi temp, (1 << PB0)  
-    out PORTB, temp  
-    rjmp END_TIMER
-
-SHOW_H1:         
-    mov temp, hora_l
-    rcall OBTENER_PATRON
-    out PORTD, temp  
-    ldi temp, (1 << PB1)  
-    out PORTB, temp  
-    rjmp END_TIMER
-
-SHOW_M10:        
-    mov temp, min_h
-    rcall OBTENER_PATRON
-    out PORTD, temp  
-    ldi temp, (1 << PB2)  
-    out PORTB, temp  
-    rjmp END_TIMER
-
-SHOW_M1:         
-    mov temp, min_l
-    rcall OBTENER_PATRON
-    out PORTD, temp  
-    ldi temp, (1 << PB3)  
-    out PORTB, temp  
-
-END_TIMER:
-    pop sreg_temp
-    pop temp
-    out SREG, temp
-    pop temp
-    reti
-
-
-;*************
-;*     MANEJO DE BOTONES            *
-;*************
-CHECK_BUTTONS:
-    sbis PINC, BUTTON_MODE
-    rcall CAMBIAR_MODO
-    sbis PINC, BUTTON_SEL
-    rcall SELECCIONAR_DIGITO
-    sbis PINC, PC2    ; Cambiado a PC2 (Incremento)
-    rcall INCREMENTAR
-    sbis PINC, PC3    ; Cambiado a PC3 (Tto)
-    rcall DECREMENTAR
-    ret
-
-;*************
-;*     CAMBIAR MODO        *
-;*************
+/*************************************/
+/********* CAMBIOS DE MODO ***********/
+/*************************************/
 CAMBIAR_MODO:
-    rcall DEBOUNCE
-    inc estado
-    cpi estado, 9
-    brne UPDATE_LEDS
-    clr estado  
+	CPI R17, 0
+	BREQ MODO_MOSTRAR_HORA
+	CPI R17, 1
+	BREQ MODO_MOSTRAR_FECHA
+	CPI R17, 2
+	BREQ MODO_CONFIGURAR_HORA
+	CPI R17, 3
+	BREQ MODO_CONFIGURAR_FECHA
+	CPI R17, 4
+	BREQ MODO_CONFIGURAR_ALARMA
+	CPI R17, 5
+	BREQ MODO_APAGAR_ALARMA
+	JMP LOOP  ; Volver al loop si no es un modo vÃ¡lido
 
-UPDATE_LEDS:
-    rcall CHECK_LED
-    ret
+/*************************************/
+/********* MODOS DE FUNCIONAMIENTO ***********/
+/*************************************/
+MODO_MOSTRAR_HORA:
+	CALL MOSTRAR_HORA
+	JMP LOOP
 
-;*************
-;*     SELECCIONAR DÍGITO        *
-;*************
-SELECCIONAR_DIGITO:
-    rcall DEBOUNCE
-    inc digit_sel
-    cpi digit_sel, 4
-    brne EXIT_SEL
-    clr digit_sel
-EXIT_SEL:
-    ret
+MODO_MOSTRAR_FECHA:
+	CALL MOSTRAR_FECHA
+	JMP LOOP
 
-;*************
-;*     CHECK LEDS        *
-;*************
-CHECK_LED:
-    cpi estado, 1
-    breq LED_HORA
-    cpi estado, 2
-    breq LED_HORA
-    cpi estado, 4
-    breq LED_FECHA
-    cpi estado, 5
-    breq LED_FECHA
-    cpi estado, 7
-    breq LED_ALARMA
-    cpi estado, 8
-    breq LED_ALARMA
+MODO_CONFIGURAR_HORA:
+	CALL CAMBIAR_HORA
+	JMP LOOP
 
-    cbi PORTB, LED1
-    cbi PORTB, LED2
-    ret
+MODO_CONFIGURAR_FECHA:
+	CALL CAMBIAR_FECHA
+	JMP LOOP
 
-LED_HORA:
-    sbi PORTB, LED1
-    sbi PORTB, LED2
-    ret
+MODO_CONFIGURAR_ALARMA:
+	CALL CAMBIAR_ALARMA
+	JMP LOOP
 
-LED_FECHA:
-    sbi PORTB, LED1
-    sbi PORTB, LED2
-    ret
-
-LED_ALARMA:
-    cbi PORTB, LED1
-    sbi PORTB, LED2
-    ret
-
-;*************
-;*     INCREMENTAR/DECREMENTAR        *
-;*************
-INCREMENTAR:
-    rcall DEBOUNCE
-    cpi estado, 1
-    breq INC_HORA
-    cpi estado, 2
-    breq INC_MIN
-    ret
-
-INC_HORA:
-    inc hora_l
-    cpi hora_l, 10
-    brne EXIT_INC
-    clr hora_l
-    inc hora_h
-    cpi hora_h, 3
-    brne EXIT_INC
-    clr hora_h
-EXIT_INC:
-    ret
-
-INC_MIN:
-    inc min_l
-    ldi temp, 10       ; Cargar el valor 10 en un registro válido
-    cp min_l, temp     ; Comparar min_l con 10
-    brne EXIT_INC      ; Si no son iguales, saltar a EXIT_INC; ? Cambié CONTINUAR por EXIT_INC
-
-    clr min_l
-    inc min_h
-    cpi min_h, 6
-    brne EXIT_INC
-    clr min_h
-    rjmp INC_HORA
+MODO_APAGAR_ALARMA:
+	CALL APAGAR
+	JMP LOOP
 
 
-	DECREMENTAR:
-    ; Disminuir horas, minutos, fecha o alarma dependiendo del estado actual
-    CPI estado, 1
-    BRNE CHECK_DEC_2
-    RJMP Dec_Horas
-CHECK_DEC_2:
-    CPI estado, 2
-    BRNE CHECK_DEC_4
-    RJMP Dec_Minutos
-CHECK_DEC_4:
-    CPI estado, 4
-    BRNE CHECK_DEC_5
-    RJMP Dec_Mes
-CHECK_DEC_5:
-    CPI estado, 5
-    BRNE CHECK_DEC_7
-    RJMP Dec_Dia
-CHECK_DEC_7:
-    CPI estado, 7
-    BRNE CHECK_DEC_8
-    RJMP Dec_Minutos_Alarma
-CHECK_DEC_8:
-    CPI estado, 8
-    BRNE END_DEC
-    RJMP Dec_Horas_Alarma
+	/*************************************/
+/********* COMPARACIÃ“N DE ALARMA ***********/
+/*************************************/
+COMPARAR_ALARMA:
+	CP R11, R19  ; Comparar horas decenas
+	BRNE FIN_ALARMA
+	CP R12, R20  ; Comparar horas unidades
+	BRNE FIN_ALARMA
+	CP R14, R21  ; Comparar minutos decenas
+	BRNE FIN_ALARMA
+	CP R15, R22  ; Comparar minutos unidades
+	BREQ ACTIVAR_ALARMA  ; Si todas coinciden, activar alarma
 
-END_DEC:
-    RET  ; Salir si el estado no es válido
+FIN_ALARMA:
+	RET
 
+/*************************************/
+/********* ACTIVAR ALARMA ***********/
+/*************************************/
+ACTIVAR_ALARMA:
+	SBI PORTB, PB5  ; Encender buzzer
+	SBI PORTB, PB4  ; Encender LED de alarma
+	SBI PORTB, PB3  ; Encender otro LED indicador
+	JMP LOOP
 
+/*************************************/
+/********* APAGAR ALARMA ***********/
+/*************************************/
+APAGAR:
+	CBI PORTB, PB5  ; Apagar buzzer
+	CBI PORTB, PB4  ; Apagar LED de alarma
+	CBI PORTB, PB3  ; Apagar otro LED indicador
+	JMP LOOP
 
+	/*************************************/
+/********* CAMBIO DE HORA ***********/
+/*************************************/
+CAMBIAR_HORA:
+	SBRS R0, PC0
+	INC R20  ; Incrementar horas unidades
+	SBRS R0, PC1
+	DEC R20  ; Decrementar horas unidades
+	SBRS R0, PC2
+	INC R22  ; Incrementar minutos unidades
+	SBRS R0, PC3
+	DEC R22  ; Decrementar minutos unidades
 
-;*************************
-; DECREMENTAR HORAS
-;*************************
-Dec_Horas:
-    CPI hora_l, 0
-    BRNE Dec_Horas_U
-    CPI hora_h, 0
-    BRNE Dec_Horas_D
-    LDI hora_h, 2
-    LDI hora_l, 3
-    RET
+	; **LÃ­mites de minutos (0-59)**
+	CPI R22, 10
+	BREQ LIMITE_MINUTOS_UNIDADES
+	CPI R21, 6
+	BREQ LIMITE_MINUTOS_DECENAS
 
-Dec_Horas_U:
-    DEC hora_l
-    RET
+	; **LÃ­mites de horas (0-23)**
+	CPI R20, 10
+	BREQ LIMITE_HORAS_UNIDADES
+	CPI R19, 2
+	BREQ LIMITE_HORAS_DECENAS
 
-Dec_Horas_D:
-    LDI hora_l, 9
-    DEC hora_h
-    RET
+	JMP LOOP
 
-;*************************
-; DECREMENTAR MINUTOS
-;*************************
-Dec_Minutos:
-    MOV temp, min_l  ; ? Usar temp como intermediario
-    CPI temp, 0
-    BRNE Dec_Minutos_U
-    MOV temp, min_h
-    CPI temp, 0
-    BRNE Dec_Minutos_D
-    LDI temp, 5
-    MOV min_h, temp
-    LDI temp, 9
-    MOV min_l, temp
-    RJMP Dec_Horas
+/*************************************/
+/********* RESTRICCIONES HORARIO ***********/
+/*************************************/
+LIMITE_MINUTOS_UNIDADES:
+	INC R21
+	CLR R22
+	JMP LOOP
 
-Dec_Minutos_U:
-    DEC min_l
-    RET
+LIMITE_MINUTOS_DECENAS:
+	CLR R21
+	CLR R22
+	INC R20
+	JMP LOOP
 
-Dec_Minutos_D:
-    LDI temp, 9
-    MOV min_l, temp
-    DEC min_h
-    RET
+LIMITE_HORAS_UNIDADES:
+	INC R19
+	CLR R20
+	JMP LOOP
 
-;*************************
-; DECREMENTAR MES
-;*************************
-Dec_Mes:
-    MOV temp, mes_d  
-    CPI temp, 0
-    BRNE Dec_Mes_Norm
-    MOV temp, mes_u
-    CPI temp, 1
-    BRNE Dec_Mes_Norm
-    LDI temp, 1
-    MOV mes_d, temp
-    LDI temp, 2
-    MOV mes_u, temp
-    RET
+LIMITE_HORAS_DECENAS:
+	CPI R20, 4
+	BREQ RESET_HORARIO
+	JMP LOOP
 
-Dec_Mes_Norm:
-    MOV temp, mes_u
-    CPI temp, 0
-    BRNE Dec_Mes_OnlyU
-    LDI temp, 9
-    MOV mes_u, temp
-    DEC mes_d
-    RET
-
-Dec_Mes_OnlyU:
-    DEC mes_u
-    RET
-
-;*************************
-; DECREMENTAR DÍA
-;*************************
-Dec_Dia:
-    LDI temp, 0
-    CP dia_d, temp
-    BRNE Dec_Dia_Norm
-
-    CP dia_u, temp
-    BRNE Dec_Dia_Norm
-
-    CALL Dec_Mes
-    CALL Obtener_Limite_Dia
-    MOV dia_d, temp
-    MOV dia_u, temp2
-    RET
-
-Dec_Dia_Norm:
-    LDI temp, 0
-    CP dia_u, temp
-    BRNE Dec_Dia_U
-
-    LDI temp, 9
-    MOV dia_u, temp
-    DEC dia_d
-    RET
-
-Dec_Dia_U:
-    DEC dia_u
-    RET
-
-;*************************
-; OBTENER LÍMITE DE DÍAS SEGÚN EL MES ACTUAL
-;*************************
-Obtener_Limite_Dia:
-    ; Verificar si el mes es FEBRERO (28 días)
-    LDI temp, 0
-    CP mes_d, temp
-    BRNE NoFebrero
-    LDI temp, 2
-    CP mes_u, temp
-    BRNE NoFebrero
-    LDI temp, 2  ; Decenas = 2
-    LDI temp, 8   ; ? Cargar valor en temp (que sí soporta LDI)
-	MOV temp2, temp  ; ? Moverlo a temp2
-
-    RET
-
-NoFebrero:
-    ; Verificar si el mes tiene 30 días (Abril, Junio, Septiembre, Noviembre)
-    LDI temp, 0
-    CP mes_d, temp
-    BRNE NoMes30
-    LDI temp, 4  ; Abril (04)
-    CP mes_u, temp
-    BREQ Mes30
-    LDI temp, 6  ; Junio (06)
-    CP mes_u, temp
-    BREQ Mes30
-    LDI temp, 9  ; Septiembre (09)
-    CP mes_u, temp
-    BREQ Mes30
-
-    LDI temp, 1
-    CP mes_d, temp
-    BRNE NoMes30
-    LDI temp, 1  ; Noviembre (11)
-    CP mes_u, temp
-    BREQ Mes30
-
-NoMes30:
-    ; Si no es febrero ni un mes de 30 días, entonces tiene 31 días
-    LDI temp, 3  ; ? Decenas = 3
-    LDI temp, 1  ; ? Cargar 1 en un registro válido
-    MOV temp2, temp  ; ? Moverlo a temp2
-    RET
+RESET_HORARIO:
+	CLR R19
+	CLR R20
+	JMP LOOP
 
 
-Mes30:
-    ; Si el mes es 04, 06, 09 o 11, asignar 30 días
-    LDI temp, 3  ; ? Decenas = 3
-    LDI temp, 0  ; ? Cargar 0 en un registro válido
-    MOV temp2, temp  ; ? Moverlo a temp2 si está en r8-r15
-    RET
+	/*************************************/
+/********* CAMBIO DE FECHA ***********/
+/*************************************/
+CAMBIAR_FECHA:
+	SBRS R0, PC0
+	INC R3  ; Incrementar dÃ­a unidades
+	SBRS R0, PC1
+	DEC R3  ; Decrementar dÃ­a unidades
+	SBRS R0, PC2
+	INC R5  ; Incrementar mes unidades
+	SBRS R0, PC3
+	DEC R5  ; Decrementar mes unidades
+
+	; **Validaciones de dÃ­as y meses**
+	CALL VALIDAR_DIA
+	CALL VALIDAR_MES
+	JMP LOOP
+
+/*************************************/
+/********* RESTRICCIONES DE FECHA ***********/
+/*************************************/
+VALIDAR_DIA:
+	MOV R25, R5  ; Cargar mes actual
+
+	; **Meses con 31 dÃ­as**
+	CPI R25, 1
+	BREQ LIMITE_31_DIAS
+	CPI R25, 3
+	BREQ LIMITE_31_DIAS
+	CPI R25, 5
+	BREQ LIMITE_31_DIAS
+	CPI R25, 7
+	BREQ LIMITE_31_DIAS
+	CPI R25, 8
+	BREQ LIMITE_31_DIAS
+	CPI R25, 10
+	BREQ LIMITE_31_DIAS
+	CPI R25, 12
+	BREQ LIMITE_31_DIAS
+
+	; **Meses con 30 dÃ­as**
+	CPI R25, 4
+	BREQ LIMITE_30_DIAS
+	CPI R25, 6
+	BREQ LIMITE_30_DIAS
+	CPI R25, 9
+	BREQ LIMITE_30_DIAS
+	CPI R25, 11
+	BREQ LIMITE_30_DIAS
+
+	; **Febrero (28 dÃ­as)**
+	CPI R25, 2
+	BREQ LIMITE_28_DIAS
+
+	JMP LOOP
+
+LIMITE_31_DIAS:
+	CPI R3, 32
+	BRSH RESET_DIA
+	JMP LOOP
+
+LIMITE_30_DIAS:
+	CPI R3, 31
+	BRSH RESET_DIA
+	JMP LOOP
+
+LIMITE_28_DIAS:
+	CPI R3, 29
+	BRSH RESET_DIA
+	JMP LOOP
+
+RESET_DIA:
+	LDI R3, 1
+	INC R5  ; Pasar al siguiente mes
+	CALL VALIDAR_MES
+	JMP LOOP
+
+VALIDAR_MES:
+	CPI R5, 13
+	BREQ RESET_MES
+	JMP LOOP
+
+RESET_MES:
+	LDI R5, 1  ; Reiniciar a enero
+	INC R6  ; Incrementar aÃ±o (suponiendo que se guarda en R6)
+	JMP LOOP
+
+	/*************************************/
+/********* MOSTRAR FECHA ***********/
+/*************************************/
+MOSTRAR_FECHA:
+	; Apagar todos los transistores antes de actualizar
+	LDI R16, 0b00000111
+	OUT PORTB, R16
+	SBI PORTD, PD7
+
+	; Cargar direcciÃ³n de la tabla de segmentos
+	LDI ZH, HIGH(TABLA << 1)
+	LDI ZL, LOW(TABLA << 1)
+
+	; **DÃ­gito 1: DÃ­a Decenas**
+	ADD ZL, R2
+	LPM R25, Z
+	OUT PORTD, R25
+	CBI PORTB, PB2  ; Activar transistor de display 1
+	CALL ESPERA
+
+	; **DÃ­gito 2: DÃ­a Unidades**
+	ADD ZL, R3
+	LPM R25, Z
+	OUT PORTD, R25
+	SBI PORTB, PB2
+	CBI PORTB, PB1  ; Activar transistor de display 2
+	CALL ESPERA
+
+	; **DÃ­gito 3: Mes Decenas**
+	ADD ZL, R4
+	LPM R25, Z
+	OUT PORTD, R25
+	SBI PORTB, PB1
+	CBI PORTB, PB0  ; Activar transistor de display 3
+	CALL ESPERA
+
+	; **DÃ­gito 4: Mes Unidades**
+	ADD ZL, R5
+	LPM R25, Z
+	OUT PORTD, R25
+	SBI PORTB, PB0
+	CBI PORTD, PD7  ; Activar transistor de display 4
+	CALL ESPERA
+	SBI PORTD, PD7  ; Apagar transistor de display 4
+
+	RET
+
+	/*************************************/
+/********* MOSTRAR ALARMA ***********/
+/*************************************/
+MOSTRAR_ALARMA:
+	; Apagar todos los transistores antes de actualizar
+	LDI R16, 0b00000111
+	OUT PORTB, R16
+	SBI PORTD, PD7
+
+	; Cargar direcciÃ³n de la tabla de segmentos
+	LDI ZH, HIGH(TABLA << 1)
+	LDI ZL, LOW(TABLA << 1)
+
+	; **DÃ­gito 1: Horas Decenas (Alarma)**
+	ADD ZL, R11
+	LPM R25, Z
+	OUT PORTD, R25
+	CBI PORTB, PB2  ; Activar transistor de display 1
+	CALL ESPERA
+
+	; **DÃ­gito 2: Horas Unidades (Alarma)**
+	ADD ZL, R12
+	LPM R25, Z
+	OUT PORTD, R25
+	SBI PORTB, PB2
+	CBI PORTB, PB1  ; Activar transistor de display 2
+	CALL ESPERA
+
+	; **DÃ­gito 3: Minutos Decenas (Alarma)**
+	ADD ZL, R14
+	LPM R25, Z
+	OUT PORTD, R25
+	SBI PORTB, PB1
+	CBI PORTB, PB0  ; Activar transistor de display 3
+	CALL ESPERA
+
+	; **DÃ­gito 4: Minutos Unidades (Alarma)**
+	ADD ZL, R15
+	LPM R25, Z
+	OUT PORTD, R25
+	SBI PORTB, PB0
+	CBI PORTD, PD7  ; Activar transistor de display 4
+	CALL ESPERA
+	SBI PORTD, PD7  ; Apagar transistor de display 4
+
+	RET
+
+/*************************************/
+/********* LOOP PRINCIPAL ***********/
+/*************************************/
+LOOP:
+	CALL COMPARAR_ALARMA  ; Verifica si la alarma debe activarse
+	CALL CAMBIAR_MODO  ; Cambia el modo segÃºn el botÃ³n presionado
+
+	; **MultiplexaciÃ³n de los displays**
+	CPI R17, 0
+	BREQ MOSTRAR_HORA
+	CPI R17, 1
+	BREQ MOSTRAR_FECHA
+	CPI R17, 4
+	BREQ MOSTRAR_ALARMA
+
+	JMP LOOP  ; Mantenerse en el bucle principal
 
 
-;*************************
-; DECREMENTAR HORAS ALARMA
-;*************************
-Dec_Horas_Alarma:
-    MOV temp, alarma_h
-    CPI temp, 0
-    BRNE Dec_Horas_Alarma_Norm
-    LDI temp, 2
-    MOV alarma_h, temp
-    LDI temp, 3
-    MOV alarma_m, temp
-    RET
+	/*************************************/
+/********* MEJORA EN MULTIPLEXACIÃ“N ***********/
+/*************************************/
+ESPERA_MULTIPLEX:
+	LDI R23, 75  ; Ajuste fino del tiempo de refresco
+DELAY_LOOP:
+	DEC R23
+	BRNE DELAY_LOOP
+	RET
 
-Dec_Horas_Alarma_Norm:
-    DEC alarma_h
-    RET
+	/*************************************/
+/********* REINICIO COMPLETO ***********/
+/*************************************/
+RESET_TOTAL:
+	CLR R19  ; Horas Decenas
+	CLR R20  ; Horas Unidades
+	CLR R21  ; Minutos Decenas
+	CLR R22  ; Minutos Unidades
 
-;*************************
-; DECREMENTAR MINUTOS ALARMA
-;*************************
-Dec_Minutos_Alarma:
-    MOV temp, alarma_m
-    CPI temp, 0
-    BRNE Dec_Minutos_Alarma_Norm
-    LDI temp, 5
-    MOV alarma_m, temp
-    RJMP Dec_Horas_Alarma
+	LDI R2, 0  ; DÃ­a Decenas
+	LDI R3, 1  ; DÃ­a Unidades
+	LDI R4, 0  ; Mes Decenas
+	LDI R5, 1  ; Mes Unidades
 
-Dec_Minutos_Alarma_Norm:
-    DEC alarma_m
-    RET
+	CLR R11  ; Horas Alarma Decenas
+	CLR R12  ; Horas Alarma Unidades
+	CLR R14  ; Minutos Alarma Decenas
+	CLR R15  ; Minutos Alarma Unidades
+
+	LDI R17, 0  ; Reiniciar al modo de mostrar hora
+	JMP LOOP
 
 
 
-DEBOUNCE:
-    ldi temp, 255
-DEBOUNCE_LOOP:
-    dec temp
-    brne DEBOUNCE_LOOP
-    ret
-
-	OBTENER_PATRON:
-    push ZH
-    push ZL
-    push temp  
-
-    ldi ZH, high(tabla_7seg * 2)
-    ldi ZL, low(tabla_7seg * 2)
-    add ZL, temp
-    brcc SKIP_INC
-    inc ZH
-SKIP_INC:
-    lpm temp, Z  ; Carga el patrón correcto
-
-    pop temp  
-    pop ZL
-    pop ZH
-    ret
